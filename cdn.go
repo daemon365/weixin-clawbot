@@ -15,9 +15,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const uploadMaxRetries = 3
+const weixinMediaMaxBytes = 100 * 1024 * 1024
 
 type UploadedFileInfo struct {
 	FileKey                     string
@@ -25,6 +27,61 @@ type UploadedFileInfo struct {
 	AESKeyHex                   string
 	FileSize                    int64
 	FileSizeCiphertext          int64
+}
+
+type SaveMediaFunc func(buffer []byte, contentType, subdir string, maxBytes int64, originalFilename string) (string, error)
+type SilkToWAVFunc func(silk []byte) ([]byte, error)
+
+var extensionToMIME = map[string]string{
+	".pdf":  "application/pdf",
+	".doc":  "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":  "application/vnd.ms-excel",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".txt":  "text/plain",
+	".csv":  "text/csv",
+	".zip":  "application/zip",
+	".tar":  "application/x-tar",
+	".gz":   "application/gzip",
+	".mp3":  "audio/mpeg",
+	".ogg":  "audio/ogg",
+	".wav":  "audio/wav",
+	".mp4":  "video/mp4",
+	".mov":  "video/quicktime",
+	".webm": "video/webm",
+	".mkv":  "video/x-matroska",
+	".avi":  "video/x-msvideo",
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+	".bmp":  "image/bmp",
+}
+
+var mimeToExtension = map[string]string{
+	"image/jpeg":        ".jpg",
+	"image/jpg":         ".jpg",
+	"image/png":         ".png",
+	"image/gif":         ".gif",
+	"image/webp":        ".webp",
+	"image/bmp":         ".bmp",
+	"video/mp4":         ".mp4",
+	"video/quicktime":   ".mov",
+	"video/webm":        ".webm",
+	"video/x-matroska":  ".mkv",
+	"video/x-msvideo":   ".avi",
+	"audio/mpeg":        ".mp3",
+	"audio/ogg":         ".ogg",
+	"audio/wav":         ".wav",
+	"application/pdf":   ".pdf",
+	"application/zip":   ".zip",
+	"application/x-tar": ".tar",
+	"application/gzip":  ".gz",
+	"text/plain":        ".txt",
+	"text/csv":          ".csv",
 }
 
 func EncryptAESECB(plaintext, key []byte) ([]byte, error) {
@@ -65,6 +122,40 @@ func BuildCDNDownloadURL(encryptedQueryParam, cdnBaseURL string) string {
 
 func BuildCDNUploadURL(cdnBaseURL, uploadParam, fileKey string) string {
 	return strings.TrimRight(cdnBaseURL, "/") + "/upload?encrypted_query_param=" + url.QueryEscape(uploadParam) + "&filekey=" + url.QueryEscape(fileKey)
+}
+
+func MIMEFromFilename(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if mime, ok := extensionToMIME[ext]; ok {
+		return mime
+	}
+	return "application/octet-stream"
+}
+
+func ExtensionFromMIME(mimeType string) string {
+	ct := strings.TrimSpace(strings.ToLower(strings.SplitN(mimeType, ";", 2)[0]))
+	if ext, ok := mimeToExtension[ct]; ok {
+		return ext
+	}
+	return ".bin"
+}
+
+func ExtensionFromContentTypeOrURL(contentType, rawURL string) string {
+	if contentType != "" {
+		if ext := ExtensionFromMIME(contentType); ext != ".bin" {
+			return ext
+		}
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ".bin"
+	}
+	ext := strings.ToLower(filepath.Ext(u.Path))
+	if _, ok := extensionToMIME[ext]; ok {
+		return ext
+	}
+	return ".bin"
 }
 
 func UploadBufferToCDN(ctx context.Context, httpClient *http.Client, buf []byte, uploadParam, fileKey, cdnBaseURL string, aesKey []byte) (string, error) {
@@ -161,6 +252,119 @@ func DownloadRemoteMediaToTemp(ctx context.Context, httpClient *http.Client, raw
 	return filePath, nil
 }
 
+func TempFileName(prefix, ext string) string {
+	return fmt.Sprintf("%s-%d-%s%s", prefix, time.Now().UnixMilli(), randomHex(4), ext)
+}
+
+func SaveMediaToDir(rootDir string) SaveMediaFunc {
+	return func(buffer []byte, contentType, subdir string, maxBytes int64, originalFilename string) (string, error) {
+		if maxBytes > 0 && int64(len(buffer)) > maxBytes {
+			return "", fmt.Errorf("media too large: %d > %d", len(buffer), maxBytes)
+		}
+		dir := rootDir
+		if subdir != "" {
+			dir = filepath.Join(dir, subdir)
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
+
+		name := originalFilename
+		if name == "" {
+			ext := ExtensionFromMIME(contentType)
+			name = TempFileName("weixin-media", ext)
+		}
+		filePath := filepath.Join(dir, name)
+		if err := os.WriteFile(filePath, buffer, 0o600); err != nil {
+			return "", err
+		}
+		return filePath, nil
+	}
+}
+
+func DownloadMediaFromItem(ctx context.Context, item MessageItem, cdnBaseURL string, httpClient *http.Client, saveMedia SaveMediaFunc, silkToWAV SilkToWAVFunc) (*InboundMediaOptions, error) {
+	result := &InboundMediaOptions{}
+	switch item.Type {
+	case MessageItemTypeImage:
+		if item.ImageItem == nil || item.ImageItem.Media == nil || item.ImageItem.Media.EncryptQueryParam == "" {
+			return result, nil
+		}
+		aesKeyBase64 := item.ImageItem.Media.AESKey
+		if item.ImageItem.AESKeyHex != "" {
+			aesKeyBase64 = base64.StdEncoding.EncodeToString([]byte(item.ImageItem.AESKeyHex))
+		}
+		var data []byte
+		var err error
+		if aesKeyBase64 != "" {
+			data, err = DownloadAndDecryptBuffer(ctx, httpClient, item.ImageItem.Media.EncryptQueryParam, aesKeyBase64, cdnBaseURL)
+		} else {
+			data, err = DownloadPlainCDNBuffer(ctx, httpClient, item.ImageItem.Media.EncryptQueryParam, cdnBaseURL)
+		}
+		if err != nil {
+			return result, err
+		}
+		path, err := saveMedia(data, "", "inbound", weixinMediaMaxBytes, "")
+		if err != nil {
+			return result, err
+		}
+		result.DecryptedPicPath = path
+	case MessageItemTypeVoice:
+		if item.VoiceItem == nil || item.VoiceItem.Media == nil || item.VoiceItem.Media.EncryptQueryParam == "" || item.VoiceItem.Media.AESKey == "" {
+			return result, nil
+		}
+		silkBuf, err := DownloadAndDecryptBuffer(ctx, httpClient, item.VoiceItem.Media.EncryptQueryParam, item.VoiceItem.Media.AESKey, cdnBaseURL)
+		if err != nil {
+			return result, err
+		}
+		if silkToWAV != nil {
+			if wavBuf, err := silkToWAV(silkBuf); err == nil && len(wavBuf) > 0 {
+				path, err := saveMedia(wavBuf, "audio/wav", "inbound", weixinMediaMaxBytes, "")
+				if err != nil {
+					return result, err
+				}
+				result.DecryptedVoicePath = path
+				result.VoiceMediaType = "audio/wav"
+				return result, nil
+			}
+		}
+		path, err := saveMedia(silkBuf, "audio/silk", "inbound", weixinMediaMaxBytes, "")
+		if err != nil {
+			return result, err
+		}
+		result.DecryptedVoicePath = path
+		result.VoiceMediaType = "audio/silk"
+	case MessageItemTypeFile:
+		if item.FileItem == nil || item.FileItem.Media == nil || item.FileItem.Media.EncryptQueryParam == "" || item.FileItem.Media.AESKey == "" {
+			return result, nil
+		}
+		data, err := DownloadAndDecryptBuffer(ctx, httpClient, item.FileItem.Media.EncryptQueryParam, item.FileItem.Media.AESKey, cdnBaseURL)
+		if err != nil {
+			return result, err
+		}
+		mime := MIMEFromFilename(firstNonEmpty(item.FileItem.FileName, "file.bin"))
+		path, err := saveMedia(data, mime, "inbound", weixinMediaMaxBytes, item.FileItem.FileName)
+		if err != nil {
+			return result, err
+		}
+		result.DecryptedFilePath = path
+		result.FileMediaType = mime
+	case MessageItemTypeVideo:
+		if item.VideoItem == nil || item.VideoItem.Media == nil || item.VideoItem.Media.EncryptQueryParam == "" || item.VideoItem.Media.AESKey == "" {
+			return result, nil
+		}
+		data, err := DownloadAndDecryptBuffer(ctx, httpClient, item.VideoItem.Media.EncryptQueryParam, item.VideoItem.Media.AESKey, cdnBaseURL)
+		if err != nil {
+			return result, err
+		}
+		path, err := saveMedia(data, "video/mp4", "inbound", weixinMediaMaxBytes, "")
+		if err != nil {
+			return result, err
+		}
+		result.DecryptedVideoPath = path
+	}
+	return result, nil
+}
+
 func UploadFileToWeixin(ctx context.Context, filePath, toUserID, cdnBaseURL string, apiOpts APIOptions) (*UploadedFileInfo, error) {
 	return uploadMediaToCDN(ctx, filePath, toUserID, cdnBaseURL, UploadMediaTypeImage, apiOpts)
 }
@@ -173,39 +377,12 @@ func UploadFileAttachmentToWeixin(ctx context.Context, filePath, toUserID, cdnBa
 	return uploadMediaToCDN(ctx, filePath, toUserID, cdnBaseURL, UploadMediaTypeFile, apiOpts)
 }
 
-func SendWeixinMediaFile(ctx context.Context, filePath, to, text, cdnBaseURL string, opts SendOptions) (string, error) {
-	apiOpts := APIOptions{
-		BaseURL:        opts.BaseURL,
-		Token:          opts.Token,
-		RouteTag:       opts.RouteTag,
-		ChannelVersion: opts.ChannelVersion,
-		HTTPClient:     opts.HTTPClient,
-		AccountID:      opts.AccountID,
-	}
-	mime := MIMEFromFilename(filePath)
-	switch {
-	case strings.HasPrefix(mime, "video/"):
-		uploaded, err := UploadVideoToWeixin(ctx, filePath, to, cdnBaseURL, apiOpts)
-		if err != nil {
-			return "", err
-		}
-		return SendVideoMessageWeixin(ctx, to, text, *uploaded, opts)
-	case strings.HasPrefix(mime, "image/"):
-		uploaded, err := UploadFileToWeixin(ctx, filePath, to, cdnBaseURL, apiOpts)
-		if err != nil {
-			return "", err
-		}
-		return SendImageMessageWeixin(ctx, to, text, *uploaded, opts)
-	default:
-		uploaded, err := UploadFileAttachmentToWeixin(ctx, filePath, to, cdnBaseURL, apiOpts)
-		if err != nil {
-			return "", err
-		}
-		return SendFileMessageWeixin(ctx, to, text, filepath.Base(filePath), *uploaded, opts)
-	}
+func uploadMediaToCDN(ctx context.Context, filePath, toUserID, cdnBaseURL string, mediaType int, apiOpts APIOptions) (*UploadedFileInfo, error) {
+	api := NewAPIClient(apiOpts)
+	return uploadMediaToCDNWithAPI(ctx, filePath, toUserID, cdnBaseURL, mediaType, api, apiOpts.HTTPClient, 0)
 }
 
-func uploadMediaToCDN(ctx context.Context, filePath, toUserID, cdnBaseURL string, mediaType int, apiOpts APIOptions) (*UploadedFileInfo, error) {
+func uploadMediaToCDNWithAPI(ctx context.Context, filePath, toUserID, cdnBaseURL string, mediaType int, api MessageAPI, httpClient *http.Client, timeout time.Duration) (*UploadedFileInfo, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
@@ -220,7 +397,6 @@ func uploadMediaToCDN(ctx context.Context, filePath, toUserID, cdnBaseURL string
 		return nil, err
 	}
 
-	api := NewAPIClient(apiOpts)
 	uploadURLResp, err := api.GetUploadURL(ctx, GetUploadURLRequest{
 		FileKey:     fileKey,
 		MediaType:   mediaType,
@@ -230,7 +406,7 @@ func uploadMediaToCDN(ctx context.Context, filePath, toUserID, cdnBaseURL string
 		FileSize:    fileSizeCiphertext,
 		NoNeedThumb: true,
 		AESKey:      hex.EncodeToString(aesKey),
-	}, 0)
+	}, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +414,15 @@ func uploadMediaToCDN(ctx context.Context, filePath, toUserID, cdnBaseURL string
 		return nil, fmt.Errorf("getUploadURL returned no upload_param")
 	}
 
-	downloadParam, err := UploadBufferToCDN(ctx, apiOpts.HTTPClient, data, uploadURLResp.UploadParam, fileKey, cdnBaseURL, aesKey)
+	if httpClient == nil {
+		if apiClient, ok := api.(*APIClient); ok && apiClient.httpClient != nil {
+			httpClient = apiClient.httpClient
+		} else {
+			httpClient = &http.Client{}
+		}
+	}
+
+	downloadParam, err := UploadBufferToCDN(ctx, httpClient, data, uploadURLResp.UploadParam, fileKey, cdnBaseURL, aesKey)
 	if err != nil {
 		return nil, err
 	}

@@ -62,12 +62,17 @@ func main() {
 ```go
 ctx := context.Background()
 
-clientID, err := weixin.SendMessageWeixin(ctx, "user@im.wechat", "hello from bot", weixin.SendOptions{
+sender := weixin.NewSender(weixin.SenderOptions{
 	BaseURL:      "https://ilinkai.weixin.qq.com",
 	Token:        "YOUR_BOT_TOKEN",
-	ContextToken: "YOUR_CONTEXT_TOKEN",
 	Timeout:      15 * time.Second,
 })
+conversation := sender.Conversation(weixin.Target{
+	ToUserID:     "user@im.wechat",
+	ContextToken: "YOUR_CONTEXT_TOKEN",
+})
+
+clientID, err := conversation.SendText(ctx, "hello from bot")
 if err != nil {
 	log.Fatal(err)
 }
@@ -103,12 +108,14 @@ if err != nil {
 
 - `Client`：扫码登录流程
 - `APIClient`：ilink bot API 封装
+- `Sender`：可复用的消息发送器
+- `Conversation`：绑定单个 `ToUserID` + `ContextToken` 的会话发送器
+- `Target`：发送目标
 - `MonitorOptions`：长轮询监听配置
-- `SendOptions`：发消息配置
 - `UploadedFileInfo`：CDN 上传结果
 
 ## 说明
 
 - 包名仍为 `weixin`，模块导入路径为 `github.com/daemon365/weixin-clawbot`。
 - 账号文件名会做 base64url 编码，避免路径字符不安全。
-- `SendMessageWeixin` 等发送函数必须提供 `ContextToken`。
+- `Target.ContextToken` 是发送消息时的必填字段。

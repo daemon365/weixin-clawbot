@@ -3,15 +3,17 @@ package weixin
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
+	cryptoRand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	mathrand "math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,7 +21,23 @@ const (
 	defaultLongPollTimeout = 35 * time.Second
 	defaultAPITimeout      = 15 * time.Second
 	defaultConfigTimeout   = 10 * time.Second
+
+	SessionExpiredErrCode = -14
+	sessionPauseDuration  = time.Hour
+
+	configCacheTTL          = 24 * time.Hour
+	configCacheInitialRetry = 2 * time.Second
+	configCacheMaxRetry     = time.Hour
 )
+
+var pauseState struct {
+	sync.Mutex
+	until map[string]time.Time
+}
+
+func init() {
+	pauseState.until = make(map[string]time.Time)
+}
 
 type APIOptions struct {
 	BaseURL        string
@@ -37,6 +55,25 @@ type APIClient struct {
 	channelVersion string
 	httpClient     *http.Client
 	accountID      string
+}
+
+type CachedConfig struct {
+	TypingTicket string
+}
+
+type configCacheEntry struct {
+	config        CachedConfig
+	everSucceeded bool
+	nextFetchAt   time.Time
+	retryDelay    time.Duration
+}
+
+type ConfigManager struct {
+	api   *APIClient
+	now   func() time.Time
+	rand  *mathrand.Rand
+	mu    sync.Mutex
+	cache map[string]configCacheEntry
 }
 
 func NewAPIClient(opts APIOptions) *APIClient {
@@ -62,6 +99,15 @@ func NewAPIClient(opts APIOptions) *APIClient {
 		channelVersion: channelVersion,
 		httpClient:     httpClient,
 		accountID:      strings.TrimSpace(opts.AccountID),
+	}
+}
+
+func NewConfigManager(api *APIClient) *ConfigManager {
+	return &ConfigManager{
+		api:   api,
+		now:   time.Now,
+		rand:  mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
+		cache: make(map[string]configCacheEntry),
 	}
 }
 
@@ -241,11 +287,97 @@ func (c *APIClient) assertSession() error {
 
 func randomWechatUIN() string {
 	buf := make([]byte, 4)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := cryptoRand.Read(buf); err != nil {
 		return base64.StdEncoding.EncodeToString([]byte("0"))
 	}
 	n := uint32(buf[0])<<24 | uint32(buf[1])<<16 | uint32(buf[2])<<8 | uint32(buf[3])
 	return base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%d", n)))
+}
+
+func PauseSession(accountID string) {
+	pauseState.Lock()
+	defer pauseState.Unlock()
+	pauseState.until[accountID] = time.Now().Add(sessionPauseDuration)
+}
+
+func IsSessionPaused(accountID string) bool {
+	return RemainingPause(accountID) > 0
+}
+
+func RemainingPause(accountID string) time.Duration {
+	pauseState.Lock()
+	defer pauseState.Unlock()
+
+	until, ok := pauseState.until[accountID]
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(until)
+	if remaining <= 0 {
+		delete(pauseState.until, accountID)
+		return 0
+	}
+	return remaining
+}
+
+func AssertSessionActive(accountID string) error {
+	if remaining := RemainingPause(accountID); remaining > 0 {
+		return fmt.Errorf("session paused for account_id=%s, %d min remaining (errcode %d)", accountID, int(remaining.Minutes()+0.999), SessionExpiredErrCode)
+	}
+	return nil
+}
+
+func resetSessionGuardForTest() {
+	pauseState.Lock()
+	defer pauseState.Unlock()
+	pauseState.until = make(map[string]time.Time)
+}
+
+func (m *ConfigManager) GetForUser(ctx context.Context, userID, contextToken string) (CachedConfig, error) {
+	m.mu.Lock()
+	entry, ok := m.cache[userID]
+	now := m.now()
+	shouldFetch := !ok || !now.Before(entry.nextFetchAt)
+	m.mu.Unlock()
+
+	if shouldFetch {
+		resp, err := m.api.GetConfig(ctx, userID, contextToken, 0)
+		if err == nil && resp.Ret == 0 {
+			next := configCacheEntry{
+				config:        CachedConfig{TypingTicket: resp.TypingTicket},
+				everSucceeded: true,
+				nextFetchAt:   now.Add(time.Duration(m.rand.Float64() * float64(configCacheTTL))),
+				retryDelay:    configCacheInitialRetry,
+			}
+			m.mu.Lock()
+			m.cache[userID] = next
+			m.mu.Unlock()
+			return next.config, nil
+		}
+
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if ok {
+			entry.retryDelay *= 2
+			if entry.retryDelay > configCacheMaxRetry {
+				entry.retryDelay = configCacheMaxRetry
+			}
+			entry.nextFetchAt = now.Add(entry.retryDelay)
+			m.cache[userID] = entry
+			return entry.config, err
+		}
+
+		m.cache[userID] = configCacheEntry{
+			config:      CachedConfig{},
+			nextFetchAt: now.Add(configCacheInitialRetry),
+			retryDelay:  configCacheInitialRetry,
+		}
+		return CachedConfig{}, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cache[userID].config, nil
 }
 
 func packageVersionFromPath(root string) string {

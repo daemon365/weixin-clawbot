@@ -15,6 +15,23 @@ import (
 	"time"
 )
 
+type stubMessageAPI struct {
+	sendCalls   int
+	lastTimeout time.Duration
+	lastReq     SendMessageRequest
+}
+
+func (s *stubMessageAPI) SendMessage(_ context.Context, req SendMessageRequest, timeout time.Duration) error {
+	s.sendCalls++
+	s.lastReq = req
+	s.lastTimeout = timeout
+	return nil
+}
+
+func (s *stubMessageAPI) GetUploadURL(context.Context, GetUploadURLRequest, time.Duration) (*GetUploadURLResponse, error) {
+	return &GetUploadURLResponse{UploadParam: "stub-upload"}, nil
+}
+
 func TestNewClientDefaults(t *testing.T) {
 	t.Parallel()
 
@@ -93,7 +110,59 @@ func TestNewAPIClientDefaultsAndHeaders(t *testing.T) {
 	}
 }
 
-func TestSendMessageWeixinBuildsExpectedRequest(t *testing.T) {
+func TestNewSenderDefaults(t *testing.T) {
+	t.Parallel()
+
+	sender := NewSender(SenderOptions{})
+	if sender.api == nil {
+		t.Fatalf("expected sender API")
+	}
+	api, ok := sender.api.(*APIClient)
+	if !ok {
+		t.Fatalf("expected *APIClient, got %T", sender.api)
+	}
+	if api.baseURL != DefaultBaseURL {
+		t.Fatalf("unexpected sender API baseURL: %q", api.baseURL)
+	}
+	if sender.httpClient == nil {
+		t.Fatalf("expected sender HTTP client")
+	}
+	if sender.cdnBaseURL != DefaultBaseURL {
+		t.Fatalf("unexpected sender CDN baseURL: %q", sender.cdnBaseURL)
+	}
+}
+
+func TestNewSenderUsesInjectedAPI(t *testing.T) {
+	t.Parallel()
+
+	api := &stubMessageAPI{}
+	sender := NewSender(SenderOptions{
+		API:     api,
+		Timeout: 3 * time.Second,
+	})
+
+	clientID, err := sender.Conversation(Target{
+		ToUserID:     "user@im.wechat",
+		ContextToken: "ctx-1",
+	}).SendText(context.Background(), "hello")
+	if err != nil {
+		t.Fatalf("SendText returned error: %v", err)
+	}
+	if clientID == "" {
+		t.Fatalf("expected client ID")
+	}
+	if api.sendCalls != 1 {
+		t.Fatalf("expected one send call, got %d", api.sendCalls)
+	}
+	if api.lastTimeout != 3*time.Second {
+		t.Fatalf("unexpected timeout: %v", api.lastTimeout)
+	}
+	if api.lastReq.Message == nil || api.lastReq.Message.ToUserID != "user@im.wechat" {
+		t.Fatalf("unexpected request payload: %#v", api.lastReq)
+	}
+}
+
+func TestConversationSendTextBuildsExpectedRequest(t *testing.T) {
 	t.Parallel()
 
 	var (
@@ -111,18 +180,22 @@ func TestSendMessageWeixinBuildsExpectedRequest(t *testing.T) {
 	}))
 	defer server.Close()
 
-	clientID, err := SendMessageWeixin(context.Background(), "user@im.wechat", "hello", SendOptions{
+	sender := NewSender(SenderOptions{
 		BaseURL:        server.URL,
 		Token:          "bot-token",
 		RouteTag:       "route-a",
 		ChannelVersion: "test-port",
 		HTTPClient:     server.Client(),
-		ContextToken:   "ctx-1",
 		AccountID:      "demo@im.bot",
 		Timeout:        time.Second,
 	})
+	conversation := sender.Conversation(Target{
+		ToUserID:     "user@im.wechat",
+		ContextToken: "ctx-1",
+	})
+	clientID, err := conversation.SendText(context.Background(), "hello")
 	if err != nil {
-		t.Fatalf("SendMessageWeixin returned error: %v", err)
+		t.Fatalf("SendText returned error: %v", err)
 	}
 
 	if gotPath != "/ilink/bot/sendmessage" {
@@ -160,7 +233,7 @@ func TestSendMessageWeixinBuildsExpectedRequest(t *testing.T) {
 	}
 }
 
-func TestSendImageMessageWeixinSendsTextThenMedia(t *testing.T) {
+func TestConversationSendImageSendsTextThenMedia(t *testing.T) {
 	t.Parallel()
 
 	var requests []SendMessageRequest
@@ -177,18 +250,23 @@ func TestSendImageMessageWeixinSendsTextThenMedia(t *testing.T) {
 	}))
 	defer server.Close()
 
-	lastID, err := SendImageMessageWeixin(context.Background(), "user@im.wechat", "caption", UploadedFileInfo{
+	sender := NewSender(SenderOptions{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+		Timeout:    time.Second,
+	})
+	conversation := sender.Conversation(Target{
+		ToUserID:     "user@im.wechat",
+		ContextToken: "ctx-2",
+	})
+
+	lastID, err := conversation.SendImage(context.Background(), "caption", UploadedFileInfo{
 		DownloadEncryptedQueryParam: "enc-param",
 		AESKeyHex:                   "00112233445566778899aabbccddeeff",
 		FileSizeCiphertext:          128,
-	}, SendOptions{
-		BaseURL:      server.URL,
-		HTTPClient:   server.Client(),
-		ContextToken: "ctx-2",
-		Timeout:      time.Second,
 	})
 	if err != nil {
-		t.Fatalf("SendImageMessageWeixin returned error: %v", err)
+		t.Fatalf("SendImage returned error: %v", err)
 	}
 
 	if len(requests) != 2 {

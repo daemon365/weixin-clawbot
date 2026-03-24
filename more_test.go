@@ -313,7 +313,7 @@ func TestAPIClientPostJSONErrorPaths(t *testing.T) {
 	}
 }
 
-func TestSendVideoAndFileMessageWeixin(t *testing.T) {
+func TestConversationSendVideoAndFile(t *testing.T) {
 	t.Parallel()
 
 	var requests []SendMessageRequest
@@ -327,30 +327,35 @@ func TestSendVideoAndFileMessageWeixin(t *testing.T) {
 	}))
 	defer server.Close()
 
-	videoID, err := SendVideoMessageWeixin(context.Background(), "user-1", "", UploadedFileInfo{
+	sender := NewSender(SenderOptions{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+	})
+
+	videoConversation := sender.Conversation(Target{
+		ToUserID:     "user-1",
+		ContextToken: "ctx-1",
+	})
+	videoID, err := videoConversation.SendVideo(context.Background(), "", UploadedFileInfo{
 		DownloadEncryptedQueryParam: "video-dl",
 		AESKeyHex:                   "00112233445566778899aabbccddeeff",
 		FileSizeCiphertext:          96,
-	}, SendOptions{
-		BaseURL:      server.URL,
-		HTTPClient:   server.Client(),
-		ContextToken: "ctx-1",
 	})
 	if err != nil {
-		t.Fatalf("SendVideoMessageWeixin returned error: %v", err)
+		t.Fatalf("SendVideo returned error: %v", err)
 	}
 
-	fileID, err := SendFileMessageWeixin(context.Background(), "user-1", "file caption", "demo.pdf", UploadedFileInfo{
+	fileConversation := sender.Conversation(Target{
+		ToUserID:     "user-1",
+		ContextToken: "ctx-2",
+	})
+	fileID, err := fileConversation.SendFile(context.Background(), "file caption", "demo.pdf", UploadedFileInfo{
 		DownloadEncryptedQueryParam: "file-dl",
 		AESKeyHex:                   "00112233445566778899aabbccddeeff",
 		FileSize:                    42,
-	}, SendOptions{
-		BaseURL:      server.URL,
-		HTTPClient:   server.Client(),
-		ContextToken: "ctx-2",
 	})
 	if err != nil {
-		t.Fatalf("SendFileMessageWeixin returned error: %v", err)
+		t.Fatalf("SendFile returned error: %v", err)
 	}
 
 	if len(requests) != 3 {
@@ -366,24 +371,30 @@ func TestSendVideoAndFileMessageWeixin(t *testing.T) {
 		t.Fatalf("expected third request to be file: %#v", requests[2])
 	}
 	if videoID == "" || fileID == "" {
-		t.Fatalf("expected client IDs from send helpers")
+		t.Fatalf("expected client IDs from sender")
 	}
 }
 
-func TestSendHelpersRequireContextToken(t *testing.T) {
+func TestConversationSendRequiresContextToken(t *testing.T) {
 	t.Parallel()
 
-	if _, err := SendMessageWeixin(context.Background(), "user-1", "hello", SendOptions{}); err == nil || !strings.Contains(err.Error(), "contextToken is required") {
-		t.Fatalf("unexpected SendMessageWeixin error: %v", err)
+	sender := NewSender(SenderOptions{})
+	conversation := sender.Conversation(Target{ToUserID: "user-1"})
+
+	if _, err := conversation.SendText(context.Background(), "hello"); err == nil || !strings.Contains(err.Error(), "contextToken is required") {
+		t.Fatalf("unexpected SendText error: %v", err)
 	}
-	if _, err := SendImageMessageWeixin(context.Background(), "user-1", "", UploadedFileInfo{}, SendOptions{}); err == nil || !strings.Contains(err.Error(), "contextToken is required") {
-		t.Fatalf("unexpected SendImageMessageWeixin error: %v", err)
+	if _, err := conversation.SendImage(context.Background(), "", UploadedFileInfo{}); err == nil || !strings.Contains(err.Error(), "contextToken is required") {
+		t.Fatalf("unexpected SendImage error: %v", err)
 	}
-	if _, err := SendVideoMessageWeixin(context.Background(), "user-1", "", UploadedFileInfo{}, SendOptions{}); err == nil || !strings.Contains(err.Error(), "contextToken is required") {
-		t.Fatalf("unexpected SendVideoMessageWeixin error: %v", err)
+	if _, err := conversation.SendVideo(context.Background(), "", UploadedFileInfo{}); err == nil || !strings.Contains(err.Error(), "contextToken is required") {
+		t.Fatalf("unexpected SendVideo error: %v", err)
 	}
-	if _, err := SendFileMessageWeixin(context.Background(), "user-1", "", "demo.txt", UploadedFileInfo{}, SendOptions{}); err == nil || !strings.Contains(err.Error(), "contextToken is required") {
-		t.Fatalf("unexpected SendFileMessageWeixin error: %v", err)
+	if _, err := conversation.SendFile(context.Background(), "", "demo.txt", UploadedFileInfo{}); err == nil || !strings.Contains(err.Error(), "contextToken is required") {
+		t.Fatalf("unexpected SendFile error: %v", err)
+	}
+	if _, err := sender.Conversation(Target{ContextToken: "ctx-1"}).SendText(context.Background(), "hello"); err == nil || !strings.Contains(err.Error(), "toUserID is required") {
+		t.Fatalf("unexpected missing toUserID error: %v", err)
 	}
 }
 
@@ -487,7 +498,7 @@ func TestUploadBufferToCDNClientError(t *testing.T) {
 	}
 }
 
-func TestUploadWrappersAndSendWeixinMediaFile(t *testing.T) {
+func TestUploadWrappersAndConversationSendMediaFile(t *testing.T) {
 	t.Parallel()
 
 	type sendRecord struct {
@@ -546,19 +557,23 @@ func TestUploadWrappersAndSendWeixinMediaFile(t *testing.T) {
 		t.Fatalf("UploadFileAttachmentToWeixin returned error: %v", err)
 	}
 
-	opts := SendOptions{
-		BaseURL:      server.URL,
-		HTTPClient:   server.Client(),
+	sender := NewSender(SenderOptions{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+		CDNBaseURL: server.URL,
+	})
+	conversation := sender.Conversation(Target{
+		ToUserID:     "user-1",
 		ContextToken: "ctx-1",
+	})
+	if _, err := conversation.SendMediaFile(context.Background(), imageFile, "img"); err != nil {
+		t.Fatalf("SendMediaFile image returned error: %v", err)
 	}
-	if _, err := SendWeixinMediaFile(context.Background(), imageFile, "user-1", "img", server.URL, opts); err != nil {
-		t.Fatalf("SendWeixinMediaFile image returned error: %v", err)
+	if _, err := conversation.SendMediaFile(context.Background(), videoFile, ""); err != nil {
+		t.Fatalf("SendMediaFile video returned error: %v", err)
 	}
-	if _, err := SendWeixinMediaFile(context.Background(), videoFile, "user-1", "", server.URL, opts); err != nil {
-		t.Fatalf("SendWeixinMediaFile video returned error: %v", err)
-	}
-	if _, err := SendWeixinMediaFile(context.Background(), docFile, "user-1", "", server.URL, opts); err != nil {
-		t.Fatalf("SendWeixinMediaFile file returned error: %v", err)
+	if _, err := conversation.SendMediaFile(context.Background(), docFile, ""); err != nil {
+		t.Fatalf("SendMediaFile file returned error: %v", err)
 	}
 
 	var (

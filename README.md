@@ -63,12 +63,17 @@ func main() {
 ```go
 ctx := context.Background()
 
-clientID, err := weixin.SendMessageWeixin(ctx, "user@im.wechat", "hello from bot", weixin.SendOptions{
+sender := weixin.NewSender(weixin.SenderOptions{
 	BaseURL:      "https://ilinkai.weixin.qq.com",
 	Token:        "YOUR_BOT_TOKEN",
-	ContextToken: "YOUR_CONTEXT_TOKEN",
 	Timeout:      15 * time.Second,
 })
+conversation := sender.Conversation(weixin.Target{
+	ToUserID:     "user@im.wechat",
+	ContextToken: "YOUR_CONTEXT_TOKEN",
+})
+
+clientID, err := conversation.SendText(ctx, "hello from bot")
 if err != nil {
 	log.Fatal(err)
 }
@@ -104,12 +109,14 @@ if err != nil {
 
 - `Client`: QR login flow
 - `APIClient`: ilink bot API wrapper
+- `Sender`: reusable outbound sender
+- `Conversation`: bound sender for one `ToUserID` + `ContextToken`
+- `Target`: outbound conversation target
 - `MonitorOptions`: long-poll monitor configuration
-- `SendOptions`: outbound message configuration
 - `UploadedFileInfo`: CDN upload result
 
 ## Notes
 
 - The package name is `weixin`, while the module import path is `github.com/daemon365/weixin-clawbot`.
 - Account files are stored as base64url-encoded filenames to avoid unsafe path characters.
-- `ContextToken` is required for outbound message helpers such as `SendMessageWeixin`.
+- `Target.ContextToken` is required for outbound messaging.
