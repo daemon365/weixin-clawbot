@@ -10,6 +10,19 @@
 
 Go package for the Weixin QR login flow and bot API used by OpenClaw.
 
+## About
+
+**weixin-clawbot** is a Go library for integrating with WeChat (Weixin) as a bot via the [iLink](https://ilinkai.weixin.qq.com) Bot platform. It serves as the underlying client for the [OpenClaw](https://github.com/daemon365) WeChat plugin.
+
+It addresses the core problem of how to log into WeChat as a bot, receive messages, and reply automatically from Go code. The main capabilities are:
+
+1. **QR-code login**: Renders a QR code in the terminal; after the user scans it with their phone, the library persists the login credentials so subsequent runs don't require re-scanning.
+2. **Message monitoring**: Receives messages from WeChat contacts and groups in real time using long polling.
+3. **Message sending**: Sends text, image, video, and file messages to individual users or groups.
+4. **Media handling**: Uploads media files to the CDN (with AES-ECB encryption) and downloads inbound media to local storage.
+
+If you are building a WeChat chatbot, automated messaging system, or customer-service bot, this library provides the low-level building blocks you need.
+
 ## Install
 
 ```bash
